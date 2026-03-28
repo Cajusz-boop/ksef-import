@@ -26,7 +26,7 @@ from datetime import datetime, timedelta
 from cryptography.hazmat.primitives import serialization, hashes
 from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-from cryptography.x509 import load_pem_x509_certificate
+from cryptography.x509 import load_pem_x509_certificate, load_der_x509_certificate
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaInMemoryUpload
@@ -88,13 +88,20 @@ class KSeFClient:
         # Znajdz certyfikat do szyfrowania klucza symetrycznego
         for cert_info in certs:
             if 'SymmetricKeyEncryption' in cert_info.get('usage', []):
-                cert_pem = cert_info['certificate']
-                # Dekoduj Base64 -> PEM
-                if not cert_pem.startswith('-----'):
-                    cert_bytes = base64.b64decode(cert_pem)
+                cert_data = cert_info['certificate']
+                # Sprobuj rozne formaty
+                if cert_data.startswith('-----'):
+                    # PEM format
+                    cert = load_pem_x509_certificate(cert_data.encode('utf-8'))
                 else:
-                    cert_bytes = cert_pem.encode('utf-8')
-                cert = load_pem_x509_certificate(cert_bytes)
+                    # Base64-encoded DER
+                    cert_bytes = base64.b64decode(cert_data)
+                    try:
+                        cert = load_der_x509_certificate(cert_bytes)
+                    except Exception:
+                        # Moze to PEM bez naglowkow
+                        pem = f"-----BEGIN CERTIFICATE-----\n{cert_data}\n-----END CERTIFICATE-----"
+                        cert = load_pem_x509_certificate(pem.encode('utf-8'))
                 return cert.public_key()
 
         raise Exception("Nie znaleziono certyfikatu SymmetricKeyEncryption")
