@@ -3,7 +3,7 @@ KSeF 2.0 Cloud Function - automatyczne pobieranie faktur zakupowych
 
 Flow:
 1. POST /auth/challenge -> challenge + timestampMs
-2. RSA-OAEP SHA256 encrypt "token|timestampMs"
+2. RSA-OAEP SHA256 encrypt "token|timestampMs" with KsefTokenEncryption cert
 3. POST /auth/ksef-token -> authenticationToken + referenceNumber
 4. GET /auth/{referenceNumber} - poll az status.code == 200
 5. POST /auth/token/redeem (Bearer authenticationToken) -> accessToken
@@ -60,11 +60,12 @@ class KSeFClient:
         return data
 
     def get_public_key_cert(self):
+        """Get KsefTokenEncryption certificate (NOT SymmetricKeyEncryption!)"""
         url = f"{self.base_url}/security/public-key-certificates"
         resp = self.session.get(url)
         resp.raise_for_status()
         for cert_info in resp.json():
-            if 'SymmetricKeyEncryption' in cert_info.get('usage', []):
+            if 'KsefTokenEncryption' in cert_info.get('usage', []):
                 cert_data = cert_info['certificate']
                 if cert_data.startswith('-----'):
                     return load_pem_x509_certificate(cert_data.encode()).public_key()
@@ -74,7 +75,7 @@ class KSeFClient:
                 except Exception:
                     pem = f"-----BEGIN CERTIFICATE-----\n{cert_data}\n-----END CERTIFICATE-----"
                     return load_pem_x509_certificate(pem.encode()).public_key()
-        raise Exception("No SymmetricKeyEncryption cert found")
+        raise Exception("No KsefTokenEncryption cert found")
 
     def encrypt_token(self, challenge_data):
         """RSA-OAEP SHA256: encrypt 'token|timestampMs' directly"""
