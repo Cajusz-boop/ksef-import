@@ -1,0 +1,10 @@
+# Secrets
+*.json
+!requirements.txt
+.env
+sa-key.json
+
+# Python
+__pycache__/
+*.pyc
+.venv/
