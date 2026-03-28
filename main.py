@@ -2,18 +2,18 @@
 KSeF 2.0 Cloud Function — automatyczne pobieranie faktur zakupowych
 Deployowane na Google Cloud Functions, triggerowane przez Cloud Scheduler
 
-API: KSeF 2.0 (od 1 lutego 2026)
+API: KSeF 2.0 (od 1 lutego 2026) — endpointy zaktualizowane do v2.3.0
 Base URL prod: https://api.ksef.mf.gov.pl/api/v2
 Base URL test: https://api-test.ksef.mf.gov.pl/api/v2
 
 Flow:
 1. POST /auth/challenge → challenge + timestamp
-2. Encrypt token z certyfikatem publicznym KSeF (AES + RSA)
+2. Encrypt token z certyfikatem publicznym KSeF (RSA-OAEP)
 3. POST /auth/ksef-token → referenceNumber
 4. POST /auth/token/redeem → accessToken + refreshToken
-5. POST /invoices/query → lista faktur zakupowych
-6. GET /invoices/{id} → XML faktury
-7. Upload XML do Google Drive folder Inbox
+5. POST /invoices/query/metadata → lista faktur zakupowych
+6. GET /invoices/ksef/{ksefNumber} → XML faktury
+7. Upload XML do Google Drive folder Inbox + permission sharing
 8. Apps Script w Sheets przetwarza XML automatycznie
 """
 
@@ -85,37 +85,26 @@ class KSeFClient:
         resp.raise_for_status()
         certs = resp.json()
 
-        # Znajdz certyfikat do szyfrowania klucza symetrycznego
         for cert_info in certs:
             if 'KsefTokenEncryption' in cert_info.get('usage', []):
                 cert_data = cert_info['certificate']
-                # Sprobuj rozne formaty
                 if cert_data.startswith('-----'):
-                    # PEM format
                     cert = load_pem_x509_certificate(cert_data.encode('utf-8'))
                 else:
-                    # Base64-encoded DER
                     cert_bytes = base64.b64decode(cert_data)
                     try:
                         cert = load_der_x509_certificate(cert_bytes)
                     except Exception:
-                        # Moze to PEM bez naglowkow
                         pem = f"-----BEGIN CERTIFICATE-----\n{cert_data}\n-----END CERTIFICATE-----"
                         cert = load_pem_x509_certificate(pem.encode('utf-8'))
                 return cert.public_key()
 
-        raise Exception("Nie znaleziono certyfikatu SymmetricKeyEncryption")
+        raise Exception("Nie znaleziono certyfikatu KsefTokenEncryption")
 
     def encrypt_token_v2(self, challenge_data):
-        """
-        KSeF 2.0: proste RSA-OAEP SHA256
-        Payload: "token|timestampMs" zaszyfrowany bezposrednio RSA (bez AES!)
-        """
+        """KSeF 2.0: RSA-OAEP SHA256 — token|timestampMs"""
         public_key = self.get_public_key_cert()
-
-        # timestampMs (milisekundy!) - nie ISO timestamp
         timestamp_ms = challenge_data.get('timestampMs', 0)
-        # Token KEY (hex value) gets encrypted, not the token identifier!
         token_value = KSEF_TOKEN_KEY if KSEF_TOKEN_KEY else KSEF_TOKEN
         plaintext = f"{token_value}|{timestamp_ms}".encode('utf-8')
 
@@ -127,15 +116,11 @@ class KSeFClient:
                 label=None
             )
         )
-
         return base64.b64encode(encrypted).decode('utf-8')
 
     def init_session(self):
         """Krok 2-4: Autoryzacja tokenem KSeF 2.0"""
-        # Krok 2: Challenge
         challenge = self.get_challenge()
-
-        # Krok 3: Autoryzacja tokenem
         encrypted_token = self.encrypt_token_v2(challenge)
 
         url = f"{self.base_url}/auth/ksef-token"
@@ -162,7 +147,7 @@ class KSeFClient:
             temp_token = str(auth_token)
         print(f"Auth referenceNumber: {self.reference_number}")
 
-        # Krok 4: Poll auth status az bedzie gotowy
+        # Poll auth status
         import time
         for attempt in range(30):
             status_url = f"{self.base_url}/auth/{self.reference_number}"
@@ -182,7 +167,7 @@ class KSeFClient:
         else:
             raise Exception("Auth polling timeout (60s)")
 
-        # Krok 5: Wymien authenticationToken na accessToken
+        # Redeem token
         redeem_url = f"{self.base_url}/auth/token/redeem"
         resp = self.session.post(redeem_url, json={}, headers={
             'Authorization': f'Bearer {temp_token}',
@@ -203,11 +188,11 @@ class KSeFClient:
         return self.access_token
 
     def query_invoices(self, date_from, date_to):
-        """Krok 5: Wyszukaj faktury zakupowe"""
-        url = f"{self.base_url}/invoices/query"
+        """Wyszukaj faktury zakupowe (KSeF 2.3.0+: /invoices/query/metadata)"""
+        url = f"{self.base_url}/invoices/query/metadata"
         payload = {
             "queryCriteria": {
-                "subjectType": "subject2",  # nabywca = my
+                "subjectType": "subject2",
                 "type": "incremental",
                 "acquisitionTimestampThresholdFrom": f"{date_from}T00:00:00",
                 "acquisitionTimestampThresholdTo": f"{date_to}T23:59:59"
@@ -215,20 +200,19 @@ class KSeFClient:
             "pageSize": 100,
             "pageOffset": 0
         }
-
         resp = self.session.post(url, json=payload)
         resp.raise_for_status()
         return resp.json()
 
     def get_invoice_xml(self, ksef_reference_number):
-        """Krok 6: Pobierz XML konkretnej faktury"""
-        url = f"{self.base_url}/invoices/{ksef_reference_number}"
+        """Pobierz XML faktury (KSeF 2.3.0+: /invoices/ksef/{ksefNumber})"""
+        url = f"{self.base_url}/invoices/ksef/{ksef_reference_number}"
         resp = self.session.get(url)
         resp.raise_for_status()
         return resp.text
 
     def terminate_session(self):
-        """Zamknij sesje (invalidate tokens)"""
+        """Zamknij sesje"""
         if self.access_token:
             try:
                 url = f"{self.base_url}/auth/sessions/current"
@@ -238,7 +222,7 @@ class KSeFClient:
 
 
 def get_drive_service():
-    """Inicjalizacja Google Drive API z Service Account"""
+    """Inicjalizacja Google Drive API z Service Account + DWD"""
     if os.path.exists(SA_KEY_FILE):
         creds = service_account.Credentials.from_service_account_file(
             SA_KEY_FILE,
@@ -272,7 +256,7 @@ def upload_to_drive(drive_service, filename, content, folder_id):
     file_id = file.get('id')
     print(f"Uploaded: {filename} (ID: {file_id})")
 
-    # Udostepnij plik wlascicielowi konta (na wypadek gdyby DWD nie dzialalo)
+    # Udostepnij plik wlascicielowi konta (backup gdy DWD nie dziala)
     owner_email = SA_EMAIL_IMPERSONATE or 'lukasz.wojenkowski@labedzhotel.pl'
     try:
         drive_service.permissions().create(
@@ -285,14 +269,14 @@ def upload_to_drive(drive_service, filename, content, folder_id):
             sendNotificationEmail=False
         ).execute()
     except Exception as e:
-        # Jezeli DWD dziala, to user juz jest ownerem — permission zglosi blad i to OK
+        # Jezeli DWD dziala, user juz jest ownerem — OK
         print(f"Permission note (non-critical): {e}")
 
     return file_id
 
 
 def get_existing_files(drive_service, folder_id):
-    """Pobierz liste istniejacych plikow w folderze (zeby nie duplikowac)"""
+    """Pobierz liste istniejacych plikow w folderze"""
     results = drive_service.files().list(
         q=f"'{folder_id}' in parents and trashed=false",
         fields="files(name)"
@@ -301,9 +285,7 @@ def get_existing_files(drive_service, folder_id):
 
 
 def main(request=None):
-    """
-    Glowna funkcja - wywolywana przez Cloud Scheduler lub HTTP trigger
-    """
+    """Glowna funkcja - Cloud Scheduler lub HTTP trigger"""
     print(f"=== KSeF Import Start: {datetime.now().isoformat()} ===")
     print(f"NIP: {KSEF_NIP}, ENV: {KSEF_ENV}, DAYS_BACK: {DAYS_BACK}")
 
@@ -317,13 +299,9 @@ def main(request=None):
     drive_service = get_drive_service()
 
     try:
-        # Autoryzacja
         ksef.init_session()
-
-        # Pobierz istniejace pliki (unikaj duplikatow)
         existing = get_existing_files(drive_service, DRIVE_INBOX_FOLDER_ID)
 
-        # Query faktur
         result = ksef.query_invoices(date_from, date_to)
         invoices = result.get('invoiceHeaderList', result.get('invoices', []))
         print(f"Found {len(invoices)} invoices from {date_from} to {date_to}")
