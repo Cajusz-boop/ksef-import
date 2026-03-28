@@ -7,18 +7,19 @@ Base URL prod: https://api.ksef.mf.gov.pl/api/v2
 Base URL test: https://api-test.ksef.mf.gov.pl/api/v2
 
 Flow:
-1. POST /auth/challenge → challenge + timestamp
+1. POST /auth/challenge -> challenge + timestamp
 2. Encrypt token z certyfikatem publicznym KSeF (AES + RSA)
-3. POST /auth/ksef-token → referenceNumber
-4. POST /auth/token/redeem → accessToken + refreshToken
-5. POST /invoices/query → lista faktur zakupowych
-6. GET /invoices/{id} → XML faktury
-7. Upload XML do Google Drive folder Inbox
-8. Apps Script w Sheets przetwarza XML automatycznie
+3. POST /auth/ksef-token -> authenticationToken + referenceNumber
+4. GET /auth/{referenceNumber} - poll az status.code == 200
+5. POST /auth/token/redeem (Bearer authenticationToken) -> accessToken + refreshToken
+6. POST /invoices/query -> lista faktur zakupowych
+7. GET /invoices/{id} -> XML faktury
+8. Upload XML do Google Drive folder Inbox
 """
 
 import os
 import json
+import time
 import base64
 import secrets
 import requests
@@ -35,11 +36,10 @@ from googleapiclient.http import MediaInMemoryUpload
 KSEF_NIP = os.environ.get('KSEF_NIP', '')
 KSEF_TOKEN = os.environ.get('KSEF_TOKEN', '')
 KSEF_TOKEN_KEY = os.environ.get('KSEF_TOKEN_KEY', '')
-KSEF_ENV = os.environ.get('KSEF_ENV', 'prod')  # 'prod' lub 'test'
+KSEF_ENV = os.environ.get('KSEF_ENV', 'prod')
 DRIVE_INBOX_FOLDER_ID = os.environ.get('DRIVE_INBOX_FOLDER_ID', '')
-DAYS_BACK = int(os.environ.get('DAYS_BACK', '1'))  # ile dni wstecz szukac
+DAYS_BACK = int(os.environ.get('DAYS_BACK', '1'))
 
-# Google Service Account
 SA_KEY_FILE = os.environ.get('SA_KEY_FILE', '/tmp/sa-key.json')
 SA_EMAIL_IMPERSONATE = os.environ.get('SA_EMAIL_IMPERSONATE', '')
 
@@ -64,7 +64,6 @@ class KSeFClient:
         })
 
     def get_challenge(self):
-        """Krok 1: Pobierz challenge autoryzacyjny"""
         url = f"{self.base_url}/auth/challenge"
         payload = {
             "contextIdentifier": {
@@ -79,7 +78,6 @@ class KSeFClient:
         return data
 
     def get_public_key_cert(self):
-        """Pobierz certyfikat publiczny KSeF do szyfrowania"""
         url = f"{self.base_url}/security/public-key-certificates"
         resp = self.session.get(url)
         resp.raise_for_status()
@@ -102,29 +100,20 @@ class KSeFClient:
         raise Exception("Nie znaleziono certyfikatu SymmetricKeyEncryption")
 
     def encrypt_token_v2(self, challenge_data):
-        """
-        Szyfrowanie tokenu w KSeF 2.0:
-        1. Generuj losowy klucz AES-256 (32 bajty)
-        2. Zaszyfruj token kluczem AES (AES-CBC)
-        3. Zaszyfruj klucz AES certyfikatem publicznym KSeF (RSA OAEP)
-        """
         public_key = self.get_public_key_cert()
 
         timestamp = challenge_data.get('timestamp', '')
         plaintext = f"{KSEF_TOKEN}|{timestamp}".encode('utf-8')
 
-        # PKCS7 padding
         pad_len = 16 - (len(plaintext) % 16)
         plaintext_padded = plaintext + bytes([pad_len] * pad_len)
 
-        # AES-256-CBC
         aes_key = secrets.token_bytes(32)
         iv = secrets.token_bytes(16)
         cipher = Cipher(algorithms.AES(aes_key), modes.CBC(iv))
         encryptor = cipher.encryptor()
         encrypted_token = encryptor.update(plaintext_padded) + encryptor.finalize()
 
-        # RSA OAEP
         encrypted_key = public_key.encrypt(
             aes_key,
             padding.OAEP(
@@ -140,10 +129,14 @@ class KSeFClient:
         }
 
     def init_session(self):
-        """Krok 2-4: Autoryzacja tokenem KSeF 2.0"""
+        """Pelny flow autoryzacji KSeF 2.0"""
+        # 1. Challenge
         challenge = self.get_challenge()
+
+        # 2. Encrypt token
         encrypted = self.encrypt_token_v2(challenge)
 
+        # 3. Submit ksef-token auth
         url = f"{self.base_url}/auth/ksef-token"
         payload = {
             "contextIdentifier": {
@@ -162,28 +155,55 @@ class KSeFClient:
 
         auth_result = resp.json()
         self.reference_number = auth_result.get('referenceNumber')
+        auth_token_data = auth_result.get('authenticationToken', {})
+        if isinstance(auth_token_data, dict):
+            temp_token = auth_token_data.get('token', '')
+        else:
+            temp_token = str(auth_token_data)
         print(f"Auth referenceNumber: {self.reference_number}")
+        print(f"Auth temp token obtained: {temp_token[:20]}...")
 
-        # Wymien na accessToken
+        # 4. Poll auth status until ready
+        for attempt in range(30):
+            status_url = f"{self.base_url}/auth/{self.reference_number}"
+            status_resp = self.session.get(status_url, headers={
+                'Authorization': f'Bearer {temp_token}',
+                'Accept': 'application/json'
+            })
+            if status_resp.status_code == 200:
+                status_data = status_resp.json()
+                status_code = status_data.get('status', {}).get('code', 0)
+                if status_code == 200:
+                    print(f"Auth status: ready (attempt {attempt+1})")
+                    break
+                elif status_code >= 400:
+                    raise Exception(f"Auth failed with code {status_code}: {status_data}")
+            print(f"Auth polling attempt {attempt+1}, status: {status_resp.status_code}")
+            time.sleep(2)
+        else:
+            raise Exception("Auth polling timeout (60s)")
+
+        # 5. Redeem authenticationToken for accessToken
         redeem_url = f"{self.base_url}/auth/token/redeem"
-        redeem_payload = {
-            "referenceNumber": self.reference_number
-        }
-
-        resp = self.session.post(redeem_url, json=redeem_payload)
+        resp = self.session.post(redeem_url, json={}, headers={
+            'Authorization': f'Bearer {temp_token}',
+            'Accept': 'application/json',
+            'Content-Type': 'application/json'
+        })
         if resp.status_code not in (200, 201):
             print(f"Token redeem failed: {resp.status_code} {resp.text[:500]}")
             resp.raise_for_status()
 
         token_result = resp.json()
-        self.access_token = token_result.get('accessToken')
-        self.refresh_token = token_result.get('refreshToken')
+        access = token_result.get('accessToken')
+        refresh = token_result.get('refreshToken')
+        self.access_token = access.get('token') if isinstance(access, dict) else access
+        self.refresh_token = refresh.get('token') if isinstance(refresh, dict) else refresh
         self.session.headers['Authorization'] = f'Bearer {self.access_token}'
         print("Session initialized successfully (KSeF 2.0)")
         return self.access_token
 
     def query_invoices(self, date_from, date_to):
-        """Krok 5: Wyszukaj faktury zakupowe"""
         url = f"{self.base_url}/invoices/query"
         payload = {
             "queryCriteria": {
@@ -195,20 +215,17 @@ class KSeFClient:
             "pageSize": 100,
             "pageOffset": 0
         }
-
         resp = self.session.post(url, json=payload)
         resp.raise_for_status()
         return resp.json()
 
     def get_invoice_xml(self, ksef_reference_number):
-        """Krok 6: Pobierz XML konkretnej faktury"""
         url = f"{self.base_url}/invoices/{ksef_reference_number}"
         resp = self.session.get(url)
         resp.raise_for_status()
         return resp.text
 
     def terminate_session(self):
-        """Zamknij sesje"""
         if self.access_token:
             try:
                 url = f"{self.base_url}/auth/sessions/current"
@@ -218,7 +235,6 @@ class KSeFClient:
 
 
 def get_drive_service():
-    """Inicjalizacja Google Drive API z Service Account"""
     if os.path.exists(SA_KEY_FILE):
         creds = service_account.Credentials.from_service_account_file(
             SA_KEY_FILE,
@@ -229,31 +245,20 @@ def get_drive_service():
     else:
         import google.auth
         creds, _ = google.auth.default(scopes=['https://www.googleapis.com/auth/drive'])
-
     return build('drive', 'v3', credentials=creds)
 
 
 def upload_to_drive(drive_service, filename, content, folder_id):
-    """Upload XML do folderu Inbox na Drive"""
-    file_metadata = {
-        'name': filename,
-        'parents': [folder_id]
-    }
-    media = MediaInMemoryUpload(
-        content.encode('utf-8'),
-        mimetype='text/xml'
-    )
+    file_metadata = {'name': filename, 'parents': [folder_id]}
+    media = MediaInMemoryUpload(content.encode('utf-8'), mimetype='text/xml')
     file = drive_service.files().create(
-        body=file_metadata,
-        media_body=media,
-        fields='id, name'
+        body=file_metadata, media_body=media, fields='id, name'
     ).execute()
     print(f"Uploaded: {filename} (ID: {file.get('id')})")
     return file.get('id')
 
 
 def get_existing_files(drive_service, folder_id):
-    """Pobierz liste istniejacych plikow w folderze"""
     results = drive_service.files().list(
         q=f"'{folder_id}' in parents and trashed=false",
         fields="files(name)"
@@ -324,7 +329,6 @@ def main(request=None):
 
 
 def ksef_import(request):
-    """Entry point dla Google Cloud Function"""
     return main(request)
 
 
