@@ -85,21 +85,16 @@ class KSeFClient:
         resp.raise_for_status()
         certs = resp.json()
 
-        # Znajdz certyfikat do szyfrowania klucza symetrycznego
         for cert_info in certs:
             if 'SymmetricKeyEncryption' in cert_info.get('usage', []):
                 cert_data = cert_info['certificate']
-                # Sprobuj rozne formaty
                 if cert_data.startswith('-----'):
-                    # PEM format
                     cert = load_pem_x509_certificate(cert_data.encode('utf-8'))
                 else:
-                    # Base64-encoded DER
                     cert_bytes = base64.b64decode(cert_data)
                     try:
                         cert = load_der_x509_certificate(cert_bytes)
                     except Exception:
-                        # Moze to PEM bez naglowkow
                         pem = f"-----BEGIN CERTIFICATE-----\n{cert_data}\n-----END CERTIFICATE-----"
                         cert = load_pem_x509_certificate(pem.encode('utf-8'))
                 return cert.public_key()
@@ -112,15 +107,13 @@ class KSeFClient:
         1. Generuj losowy klucz AES-256 (32 bajty)
         2. Zaszyfruj token kluczem AES (AES-CBC)
         3. Zaszyfruj klucz AES certyfikatem publicznym KSeF (RSA OAEP)
-        4. Zwroc oba jako Base64
         """
         public_key = self.get_public_key_cert()
 
-        # Dane do zaszyfrowania: token|timestamp
         timestamp = challenge_data.get('timestamp', '')
         plaintext = f"{KSEF_TOKEN}|{timestamp}".encode('utf-8')
 
-        # Pad do wielokrotnosci 16 (PKCS7)
+        # PKCS7 padding
         pad_len = 16 - (len(plaintext) % 16)
         plaintext_padded = plaintext + bytes([pad_len] * pad_len)
 
@@ -131,7 +124,7 @@ class KSeFClient:
         encryptor = cipher.encryptor()
         encrypted_token = encryptor.update(plaintext_padded) + encryptor.finalize()
 
-        # RSA OAEP - szyfruj klucz AES
+        # RSA OAEP
         encrypted_key = public_key.encrypt(
             aes_key,
             padding.OAEP(
@@ -148,18 +141,16 @@ class KSeFClient:
 
     def init_session(self):
         """Krok 2-4: Autoryzacja tokenem KSeF 2.0"""
-        # Krok 2: Challenge
         challenge = self.get_challenge()
-
-        # Krok 3: Autoryzacja tokenem
         encrypted = self.encrypt_token_v2(challenge)
 
         url = f"{self.base_url}/auth/ksef-token"
         payload = {
             "contextIdentifier": {
-                "type": "onip",
-                "identifier": KSEF_NIP
+                "type": "Nip",
+                "value": KSEF_NIP
             },
+            "challenge": challenge.get('challenge', ''),
             "encryptedToken": encrypted['encryptedToken'],
             "encryptedKey": encrypted['encryptedKey']
         }
@@ -173,7 +164,7 @@ class KSeFClient:
         self.reference_number = auth_result.get('referenceNumber')
         print(f"Auth referenceNumber: {self.reference_number}")
 
-        # Krok 4: Wymien na accessToken
+        # Wymien na accessToken
         redeem_url = f"{self.base_url}/auth/token/redeem"
         redeem_payload = {
             "referenceNumber": self.reference_number
@@ -196,7 +187,7 @@ class KSeFClient:
         url = f"{self.base_url}/invoices/query"
         payload = {
             "queryCriteria": {
-                "subjectType": "subject2",  # nabywca = my
+                "subjectType": "subject2",
                 "type": "incremental",
                 "acquisitionTimestampThresholdFrom": f"{date_from}T00:00:00",
                 "acquisitionTimestampThresholdTo": f"{date_to}T23:59:59"
@@ -217,7 +208,7 @@ class KSeFClient:
         return resp.text
 
     def terminate_session(self):
-        """Zamknij sesje (invalidate tokens)"""
+        """Zamknij sesje"""
         if self.access_token:
             try:
                 url = f"{self.base_url}/auth/sessions/current"
@@ -257,13 +248,12 @@ def upload_to_drive(drive_service, filename, content, folder_id):
         media_body=media,
         fields='id, name'
     ).execute()
-
     print(f"Uploaded: {filename} (ID: {file.get('id')})")
     return file.get('id')
 
 
 def get_existing_files(drive_service, folder_id):
-    """Pobierz liste istniejacych plikow w folderze (zeby nie duplikowac)"""
+    """Pobierz liste istniejacych plikow w folderze"""
     results = drive_service.files().list(
         q=f"'{folder_id}' in parents and trashed=false",
         fields="files(name)"
@@ -272,9 +262,6 @@ def get_existing_files(drive_service, folder_id):
 
 
 def main(request=None):
-    """
-    Glowna funkcja - wywolywana przez Cloud Scheduler lub HTTP trigger
-    """
     print(f"=== KSeF Import Start: {datetime.now().isoformat()} ===")
     print(f"NIP: {KSEF_NIP}, ENV: {KSEF_ENV}, DAYS_BACK: {DAYS_BACK}")
 
@@ -288,13 +275,9 @@ def main(request=None):
     drive_service = get_drive_service()
 
     try:
-        # Autoryzacja
         ksef.init_session()
-
-        # Pobierz istniejace pliki (unikaj duplikatow)
         existing = get_existing_files(drive_service, DRIVE_INBOX_FOLDER_ID)
 
-        # Query faktur
         result = ksef.query_invoices(date_from, date_to)
         invoices = result.get('invoiceHeaderList', result.get('invoices', []))
         print(f"Found {len(invoices)} invoices from {date_from} to {date_to}")
